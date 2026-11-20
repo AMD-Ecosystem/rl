@@ -466,6 +466,10 @@ The CUDA wheel is optional: if you do not need CUDA prioritized replay buffers,
 or if your prioritized replay buffers run on CPU, keep using `pip install
 torchrl`.
 
+On AMD GPUs, install TorchRL from source (see local development below) against
+a ROCm build of PyTorch: the GPU prioritized replay-buffer kernels are compiled
+whenever ROCm is found.
+
 Install common optional dependencies:
 
 ```bash

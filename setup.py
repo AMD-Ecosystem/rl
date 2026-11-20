@@ -21,6 +21,7 @@ from torch.utils.cpp_extension import (
     CppExtension,
     CUDA_HOME,
     CUDAExtension,
+    ROCM_HOME,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,8 @@ def _should_build_cuda() -> bool:
     force_cuda = os.getenv("FORCE_CUDA", "0") == "1"
     if force_cuda:
         return True
+    if getattr(torch.version, "hip", None) is not None:
+        return ROCM_HOME is not None
     torch_cuda_version = getattr(torch.version, "cuda", None)
     if CUDA_HOME is None or torch_cuda_version is None:
         return False
@@ -99,6 +102,11 @@ def _get_build_cuda_version() -> str | None:
     if not _should_build_cuda():
         return None
     return _get_nvcc_cuda_version() or getattr(torch.version, "cuda", None)
+
+
+def _device_debug_flag() -> str:
+    # nvcc's -G (device debug info) means something else to hipcc/clang.
+    return "-g" if getattr(torch.version, "hip", None) is not None else "-G"
 
 
 def _get_cxx20_compatibility_flag() -> str | None:
@@ -150,6 +158,7 @@ def _check_and_clean_stale_builds():
     current_torch_version = torch.__version__
     current_python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
     current_cuda_version = getattr(torch.version, "cuda", None)
+    current_hip_version = getattr(torch.version, "hip", None)
     current_build_cuda_version = _get_build_cuda_version()
     current_force_cuda = os.getenv("FORCE_CUDA", "0") == "1"
     current_build_cuda = _should_build_cuda()
@@ -161,6 +170,7 @@ def _check_and_clean_stale_builds():
             old_torch = build_info.get("torch_version")
             old_python = build_info.get("python_version")
             old_cuda = build_info.get("cuda_version")
+            old_hip = build_info.get("hip_version")
             old_build_cuda_version = build_info.get("build_cuda_version")
             old_force_cuda = build_info.get("force_cuda", False)
             old_build_cuda = build_info.get("build_cuda", False)
@@ -169,6 +179,7 @@ def _check_and_clean_stale_builds():
                 old_torch != current_torch_version
                 or old_python != current_python_version
                 or old_cuda != current_cuda_version
+                or old_hip != current_hip_version
                 or old_build_cuda_version != current_build_cuda_version
                 or old_force_cuda != current_force_cuda
                 or old_build_cuda != current_build_cuda
@@ -178,6 +189,7 @@ def _check_and_clean_stale_builds():
                     f"PyTorch {old_torch} -> {current_torch_version}, "
                     f"Python {old_python} -> {current_python_version}, "
                     f"CUDA {old_cuda} -> {current_cuda_version}, "
+                    f"HIP {old_hip} -> {current_hip_version}, "
                     f"build CUDA version {old_build_cuda_version} -> "
                     f"{current_build_cuda_version}, "
                     f"FORCE_CUDA {old_force_cuda} -> {current_force_cuda}, "
@@ -216,6 +228,7 @@ def _check_and_clean_stale_builds():
                 "torch_version": current_torch_version,
                 "python_version": current_python_version,
                 "cuda_version": current_cuda_version,
+                "hip_version": current_hip_version,
                 "build_cuda_version": current_build_cuda_version,
                 "force_cuda": current_force_cuda,
                 "build_cuda": current_build_cuda,
@@ -268,7 +281,7 @@ def get_extensions():
                 extra_compile_args["cxx"].append("/DWITH_CUDA")
                 extra_compile_args["nvcc"] = [
                     "-O0",
-                    "-G",
+                    _device_debug_flag(),
                     "-DWITH_CUDA",
                 ]
             extra_link_args = ["/DEBUG"]
@@ -307,7 +320,7 @@ def get_extensions():
                 extra_compile_args["cxx"].append("-DWITH_CUDA")
                 extra_compile_args["nvcc"] = [
                     "-O0",
-                    "-G",
+                    _device_debug_flag(),
                     "-DWITH_CUDA",
                 ]
             extra_link_args = ["-O0", "-g"]

@@ -25,6 +25,12 @@ python setup.py develop
 ```
 in your shell.
 
+With a ROCm build of PyTorch, this also compiles the GPU segment trees used by
+prioritized replay buffers whenever ROCm is found, as it does with a CUDA build
+and a matching `nvcc`. `PYTORCH_ROCM_ARCH` (for example `gfx942`) limits the
+build to your GPU architecture, and `FORCE_CUDA=1` builds the GPU extension
+even when it is not detected.
+
 ### Local development with uv
 
 For a local development environment, you can also use

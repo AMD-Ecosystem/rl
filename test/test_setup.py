@@ -157,6 +157,104 @@ def test_no_cxx20_fallback_for_older_torch(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "hip_version,cuda_version,rocm_home,nvcc_version,force_cuda,expected",
+    [
+        pytest.param("7.2", None, "/opt/rocm", None, "0", True, id="rocm"),
+        pytest.param("7.2", None, None, None, "0", False, id="rocm-no-rocm-home"),
+        pytest.param("7.2", None, None, None, "1", True, id="rocm-force-cuda"),
+        pytest.param(None, "12.8", None, "12.8", "0", True, id="cuda"),
+        pytest.param(None, "12.8", None, "12.6", "0", False, id="cuda-nvcc-mismatch"),
+        pytest.param(None, None, "/opt/rocm", None, "0", False, id="cpu"),
+    ],
+)
+def test_should_build_gpu_extension(
+    monkeypatch,
+    hip_version,
+    cuda_version,
+    rocm_home,
+    nvcc_version,
+    force_cuda,
+    expected,
+):
+    spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")
+    setup_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(setup_module)
+
+    monkeypatch.setenv("FORCE_CUDA", force_cuda)
+    monkeypatch.setattr(setup_module.torch.version, "hip", hip_version)
+    monkeypatch.setattr(setup_module.torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(setup_module, "ROCM_HOME", rocm_home)
+    monkeypatch.setattr(
+        setup_module, "CUDA_HOME", "/usr/local/cuda" if nvcc_version else None
+    )
+    monkeypatch.setattr(setup_module, "_get_nvcc_cuda_version", lambda: nvcc_version)
+
+    assert setup_module._should_build_cuda() is expected
+
+
+@pytest.mark.skipif(_IS_WINDOWS, reason="checks the Unix compiler flags")
+@pytest.mark.parametrize(
+    "hip_version,debug_flag", [("7.2", "-g"), (None, "-G")], ids=["rocm", "cuda"]
+)
+def test_debug_build_device_debug_flag(monkeypatch, hip_version, debug_flag):
+    spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")
+    setup_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(setup_module)
+
+    monkeypatch.setenv("DEBUG", "1")
+    monkeypatch.setattr(setup_module.torch.version, "hip", hip_version)
+    monkeypatch.setattr(setup_module, "_should_build_cuda", lambda: True)
+    monkeypatch.setattr(
+        setup_module, "CUDAExtension", lambda name, sources, **kwargs: kwargs
+    )
+
+    (extension,) = setup_module.get_extensions()
+    assert extension["extra_compile_args"]["nvcc"] == ["-O0", debug_flag, "-DWITH_CUDA"]
+
+
+def test_hip_version_change_cleans_stale_extension(monkeypatch, tmp_path: Path):
+    spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")
+    setup_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(setup_module)
+
+    monkeypatch.setenv("FORCE_CUDA", "0")
+    monkeypatch.setattr(setup_module.torch.version, "hip", "7.2")
+    monkeypatch.setattr(setup_module.torch.version, "cuda", None)
+    monkeypatch.setattr(setup_module, "ROCM_HOME", "/opt/rocm")
+    monkeypatch.setattr(setup_module, "ROOT_DIR", tmp_path)
+    build_info_file = tmp_path / "build" / ".torchrl_build_info.json"
+    monkeypatch.setattr(setup_module, "_BUILD_INFO_FILE", build_info_file)
+
+    build_info_file.parent.mkdir()
+    build_info_file.write_text(
+        json.dumps(
+            {
+                "torch_version": setup_module.torch.__version__,
+                "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "cuda_version": None,
+                "hip_version": "7.1",
+                "build_cuda_version": None,
+                "force_cuda": False,
+                "build_cuda": True,
+            }
+        )
+    )
+    ext = ".pyd" if _IS_WINDOWS else ".so"
+    stale = (
+        tmp_path
+        / "torchrl"
+        / f"_torchrl.cpython-{sys.version_info.major}{sys.version_info.minor}-x{ext}"
+    )
+    stale.parent.mkdir()
+    stale.touch()
+
+    setup_module._check_and_clean_stale_builds()
+
+    assert not stale.exists()
+    assert json.loads(build_info_file.read_text())["hip_version"] == "7.2"
+
+
+@pytest.mark.parametrize(
     "editable",
     [
         pytest.param(
