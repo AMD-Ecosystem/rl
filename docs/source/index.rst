@@ -64,9 +64,10 @@ or via a ``git clone`` if you're willing to contribute to the library:
   $ python setup.py develop
 
 With a ROCm build of PyTorch, ``python setup.py develop`` also compiles the GPU
-segment trees used by prioritized replay buffers whenever ROCm is found.
-``PYTORCH_ROCM_ARCH`` (for example ``gfx942``) limits the build to your GPU
-architecture.
+segment trees used by prioritized replay buffers whenever ROCm with ``hipcc``
+is found. With the ROCm SDK Python packages, install ``rocm[devel]`` and run
+``rocm-sdk init`` first. ``PYTORCH_ROCM_ARCH`` (for example ``gfx942``) limits
+the build to your GPU architecture.
 
 If you use ``uv`` and you installed a specific PyTorch build beforehand (e.g. a nightly wheel),
 use ``--no-deps`` for the editable installs to prevent dependency re-resolution (and potential PyTorch downgrades):

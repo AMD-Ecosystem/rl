@@ -59,6 +59,22 @@ def _has_nvcc() -> bool:
     return nvcc.is_file()
 
 
+def _has_hipcc() -> bool:
+    # hipcc also needs the ROCm device libraries to compile device code; clang
+    # looks for them in <ROCm>/amdgcn/bitcode and in its resource directory.
+    if ROCM_HOME is None:
+        return False
+    rocm_home = Path(ROCM_HOME)
+    hipcc_names = ("hipcc.exe", "hipcc.bat") if sys.platform == "win32" else ("hipcc",)
+    if not any((rocm_home / "bin" / name).is_file() for name in hipcc_names):
+        return False
+    if os.getenv("HIP_DEVICE_LIB_PATH"):
+        return True
+    return any(rocm_home.glob("amdgcn/bitcode/*.bc")) or any(
+        rocm_home.glob("lib/llvm/lib/clang/*/lib/amdgcn/bitcode/*.bc")
+    )
+
+
 def _get_nvcc_cuda_version() -> str | None:
     if not _has_nvcc():
         return None
@@ -80,7 +96,17 @@ def _should_build_cuda() -> bool:
     if force_cuda:
         return True
     if getattr(torch.version, "hip", None) is not None:
-        return ROCM_HOME is not None
+        if ROCM_HOME is None:
+            return False
+        if not _has_hipcc():
+            logger.warning(
+                "Skipping TorchRL GPU extension build because the ROCm installation "
+                "at %s has no hipcc or no ROCm device libraries. Set FORCE_CUDA=1 "
+                "to build anyway.",
+                ROCM_HOME,
+            )
+            return False
+        return True
     torch_cuda_version = getattr(torch.version, "cuda", None)
     if CUDA_HOME is None or torch_cuda_version is None:
         return False
