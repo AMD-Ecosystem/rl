@@ -26,9 +26,10 @@ python setup.py develop
 in your shell.
 
 With a ROCm build of PyTorch, this also compiles the GPU segment trees used by
-prioritized replay buffers whenever ROCm with `hipcc` and its device libraries
-is found, as it does with a CUDA build and a matching `nvcc`; otherwise it
-builds the CPU kernels and logs a warning. With the ROCm SDK Python packages,
+prioritized replay buffers whenever the ROCm installation's `hipcc` can compile
+them (it needs the ROCm device libraries and math library headers), as it does
+with a CUDA build and a matching `nvcc`; otherwise it builds the CPU kernels and
+logs a warning that names what is missing. With the ROCm SDK Python packages,
 install `rocm[devel]` and run `rocm-sdk init` first. `PYTORCH_ROCM_ARCH` (for
 example `gfx942`) limits the build to your GPU architecture, and `FORCE_CUDA=1`
 builds the GPU extension even when it is not detected.

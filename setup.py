@@ -12,15 +12,19 @@ import shlex
 import subprocess
 import sys
 import sysconfig
+import tempfile
 from pathlib import Path
 
 import torch
 from setuptools import setup
 from torch.utils.cpp_extension import (
     BuildExtension,
+    COMMON_HIP_FLAGS,
+    COMMON_HIPCC_FLAGS,
     CppExtension,
     CUDA_HOME,
     CUDAExtension,
+    include_paths,
     ROCM_HOME,
 )
 
@@ -59,20 +63,60 @@ def _has_nvcc() -> bool:
     return nvcc.is_file()
 
 
-def _has_hipcc() -> bool:
-    # hipcc also needs the ROCm device libraries to compile device code; clang
-    # looks for them in <ROCm>/amdgcn/bitcode and in its resource directory.
-    if ROCM_HOME is None:
-        return False
-    rocm_home = Path(ROCM_HOME)
-    hipcc_names = ("hipcc.exe", "hipcc.bat") if sys.platform == "win32" else ("hipcc",)
-    if not any((rocm_home / "bin" / name).is_file() for name in hipcc_names):
-        return False
+def _hip_device_lib_args() -> list[str]:
+    # The ROCm SDK Python packages keep the device libraries in lib/llvm/amdgcn,
+    # and on Windows nothing links them to <ROCm>/amdgcn, where hipcc looks.
+    if getattr(torch.version, "hip", None) is None or ROCM_HOME is None:
+        return []
     if os.getenv("HIP_DEVICE_LIB_PATH"):
-        return True
-    return any(rocm_home.glob("amdgcn/bitcode/*.bc")) or any(
-        rocm_home.glob("lib/llvm/lib/clang/*/lib/amdgcn/bitcode/*.bc")
-    )
+        return []
+    rocm_home = Path(ROCM_HOME)
+    bitcode = rocm_home / "lib" / "llvm" / "amdgcn" / "bitcode"
+    if (rocm_home / "amdgcn" / "bitcode").is_dir() or not any(bitcode.glob("*.bc")):
+        return []
+    return [f"--rocm-device-lib-path={bitcode}"]
+
+
+def _hipcc_error() -> str | None:
+    """Return why hipcc cannot compile the GPU extension, or None if it can.
+
+    Preprocesses the ROCm headers the hipified kernel includes, with the flags the
+    build passes to hipcc. This fails when the ROCm device libraries or the math
+    library headers that PyTorch's HIP headers include (hipBLAS, hipSPARSE, ...)
+    are missing.
+    """
+    rocm_bin = Path(ROCM_HOME) / "bin"
+    hipcc_names = ("hipcc.exe", "hipcc.bat") if sys.platform == "win32" else ("hipcc",)
+    hipcc = next((rocm_bin / n for n in hipcc_names if (rocm_bin / n).is_file()), None)
+    if hipcc is None:
+        return f"no hipcc in {rocm_bin}"
+    archs = os.getenv("PYTORCH_ROCM_ARCH", "").replace(" ", ";").split(";")
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "probe.hip"
+        source.write_text(
+            "#include <ATen/hip/HIPContext.h>\n#include <c10/hip/HIPGuard.h>\n"
+        )
+        command = [
+            str(hipcc),
+            "-E",
+            str(source),
+            "-o",
+            str(Path(tmp) / "probe.i"),
+            *COMMON_HIP_FLAGS,
+            *COMMON_HIPCC_FLAGS,
+            *(f"--offload-arch={arch}" for arch in archs if arch),
+            *(f"-I{path}" for path in include_paths(device_type="cuda")),
+            *_hip_device_lib_args(),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True)
+        except OSError as err:
+            return str(err)
+    if result.returncode == 0:
+        return None
+    output = result.stderr.splitlines() or result.stdout.splitlines()
+    errors = [line for line in output if "error" in line]
+    return (errors or output or [f"{hipcc} exited with {result.returncode}"])[0].strip()
 
 
 def _get_nvcc_cuda_version() -> str | None:
@@ -98,12 +142,14 @@ def _should_build_cuda() -> bool:
     if getattr(torch.version, "hip", None) is not None:
         if ROCM_HOME is None:
             return False
-        if not _has_hipcc():
+        hipcc_error = _hipcc_error()
+        if hipcc_error is not None:
             logger.warning(
-                "Skipping TorchRL GPU extension build because the ROCm installation "
-                "at %s has no hipcc or no ROCm device libraries. Set FORCE_CUDA=1 "
-                "to build anyway.",
+                "Skipping TorchRL GPU extension build because hipcc from the ROCm "
+                "installation at %s cannot compile it: %s. Set FORCE_CUDA=1 to "
+                "build anyway.",
                 ROCM_HOME,
+                hipcc_error,
             )
             return False
         return True
@@ -356,6 +402,9 @@ def get_extensions():
             # extension. Strip symbols at link time in release builds; the
             # dynamic symbol table (needed by dlopen) is unaffected.
             extra_link_args = ["-Wl,-x"] if sys.platform == "darwin" else ["-Wl,-s"]
+
+    if build_cuda:
+        extra_compile_args["nvcc"] += _hip_device_lib_args()
 
     extensions_dir = "torchrl/csrc"
 

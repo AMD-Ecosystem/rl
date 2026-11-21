@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 _ROOT = Path(__file__).resolve().parents[1]
 _IS_WINDOWS = sys.platform == "win32"
@@ -156,80 +157,49 @@ def test_no_cxx20_fallback_for_older_torch(monkeypatch):
     assert setup_module._get_cxx20_compatibility_flag() is None
 
 
-def _make_rocm_home(root: Path, layout: str | None) -> str | None:
-    """Lay out the ROCm files that decide whether hipcc can compile device code."""
-    if layout is None:
-        return None
-    files = {
-        # Device libraries where clang looks for them: in <ROCm>/amdgcn/bitcode
-        # or in its resource directory.
-        "rocm": ["bin/hipcc", "amdgcn/bitcode/ocml.bc"],
-        "rocm-clang-resource-dir": [
-            "bin/hipcc",
-            "lib/llvm/lib/clang/22/lib/amdgcn/bitcode/ocml.bc",
-        ],
-        # hipcc present, device libraries in a directory clang does not search
-        # (the core-only ROCm SDK wheel layout).
-        "rocm-no-device-libs": ["bin/hipcc", "lib/llvm/amdgcn/bitcode/ocml.bc"],
-        # ROCm runtime without a compiler.
-        "rocm-no-hipcc": ["lib/libamdhip64.so", "amdgcn/bitcode/ocml.bc"],
-    }[layout]
-    for name in files:
-        path = root / name
-        if name == "bin/hipcc" and _IS_WINDOWS:
-            path = path.with_name("hipcc.exe")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-    return str(root)
+_HIPSPARSE_MISSING = "fatal error: 'hipsparse/hipsparse.h' file not found"
 
 
 @pytest.mark.parametrize(
-    "hip_version,cuda_version,rocm_layout,nvcc_version,force_cuda,expected",
+    "hip_version,cuda_version,rocm_home,hipcc_error,nvcc_version,force_cuda,expected",
     [
-        pytest.param("7.2", None, "rocm", None, "0", True, id="rocm"),
+        pytest.param("7.2", None, "/rocm", None, None, "0", True, id="rocm"),
         pytest.param(
             "7.2",
             None,
-            "rocm-clang-resource-dir",
-            None,
-            "0",
-            True,
-            id="rocm-clang-resource-dir",
-        ),
-        pytest.param(
-            "7.2",
-            None,
-            "rocm-no-device-libs",
+            "/rocm",
+            _HIPSPARSE_MISSING,
             None,
             "0",
             False,
-            id="rocm-no-device-libs",
-        ),
-        pytest.param(
-            "7.2", None, "rocm-no-hipcc", None, "0", False, id="rocm-no-hipcc"
+            id="rocm-hipcc-cannot-compile",
         ),
         pytest.param(
             "7.2",
             None,
-            "rocm-no-device-libs",
+            "/rocm",
+            _HIPSPARSE_MISSING,
             None,
             "1",
             True,
-            id="rocm-no-device-libs-force-cuda",
+            id="rocm-hipcc-cannot-compile-force-cuda",
         ),
-        pytest.param("7.2", None, None, None, "0", False, id="rocm-no-rocm-home"),
-        pytest.param("7.2", None, None, None, "1", True, id="rocm-force-cuda"),
-        pytest.param(None, "12.8", None, "12.8", "0", True, id="cuda"),
-        pytest.param(None, "12.8", None, "12.6", "0", False, id="cuda-nvcc-mismatch"),
-        pytest.param(None, None, "rocm", None, "0", False, id="cpu"),
+        pytest.param("7.2", None, None, None, None, "0", False, id="rocm-no-rocm-home"),
+        pytest.param("7.2", None, None, None, None, "1", True, id="rocm-force-cuda"),
+        pytest.param(None, "12.8", None, None, "12.8", "0", True, id="cuda"),
+        pytest.param(
+            None, "12.8", None, None, "12.6", "0", False, id="cuda-nvcc-mismatch"
+        ),
+        pytest.param(None, None, None, None, None, "0", False, id="cpu"),
     ],
 )
 def test_should_build_gpu_extension(
     monkeypatch,
-    tmp_path: Path,
+    caplog,
     hip_version,
     cuda_version,
-    rocm_layout,
+    rocm_home,
+    hipcc_error,
     nvcc_version,
     force_cuda,
     expected,
@@ -239,40 +209,95 @@ def test_should_build_gpu_extension(
     spec.loader.exec_module(setup_module)
 
     monkeypatch.setenv("FORCE_CUDA", force_cuda)
-    monkeypatch.delenv("HIP_DEVICE_LIB_PATH", raising=False)
     monkeypatch.setattr(setup_module.torch.version, "hip", hip_version)
     monkeypatch.setattr(setup_module.torch.version, "cuda", cuda_version)
-    monkeypatch.setattr(
-        setup_module, "ROCM_HOME", _make_rocm_home(tmp_path, rocm_layout)
-    )
+    monkeypatch.setattr(setup_module, "ROCM_HOME", rocm_home)
+    monkeypatch.setattr(setup_module, "_hipcc_error", lambda: hipcc_error)
     monkeypatch.setattr(
         setup_module, "CUDA_HOME", "/usr/local/cuda" if nvcc_version else None
     )
     monkeypatch.setattr(setup_module, "_get_nvcc_cuda_version", lambda: nvcc_version)
 
-    assert setup_module._should_build_cuda() is expected
+    with caplog.at_level("WARNING"):
+        assert setup_module._should_build_cuda() is expected
+    if hipcc_error is not None and force_cuda == "0":
+        # The warning names the installation and what hipcc is missing.
+        assert rocm_home in caplog.text
+        assert "'hipsparse/hipsparse.h' file not found" in caplog.text
+        assert "Set FORCE_CUDA=1" in caplog.text
 
 
-def test_rocm_without_device_libs_warns(monkeypatch, tmp_path: Path, caplog):
+# The files that decide the device library path, as the ROCm 10.2 SDK lays them
+# out. The SDK Python packages keep the device libraries in lib/llvm/amdgcn; the
+# Linux devel package links <ROCm>/amdgcn to it, the Windows one and the core
+# package do not. A system install has <ROCm>/amdgcn itself.
+_ROCM_LAYOUTS = {
+    "linux-devel": [
+        "bin/hipcc",
+        "amdgcn/bitcode/ocml.bc",
+        "lib/llvm/amdgcn/bitcode/ocml.bc",
+    ],
+    "linux-core": ["bin/hipcc", "lib/llvm/amdgcn/bitcode/ocml.bc"],
+    "windows-devel": [
+        "bin/hipcc.exe",
+        "bin/hipcc.bat",
+        "lib/llvm/amdgcn/bitcode/ocml.bc",
+    ],
+    "system": ["bin/hipcc", "amdgcn/bitcode/ocml.bc", "llvm/bin/clang"],
+}
+
+
+@pytest.mark.parametrize(
+    "layout,hip_device_lib_path,passes_device_lib_path",
+    [
+        pytest.param("linux-devel", None, False, id="linux-devel"),
+        pytest.param("linux-core", None, True, id="linux-core"),
+        pytest.param(
+            "linux-core", "/bitcode", False, id="linux-core-hip-device-lib-path"
+        ),
+        pytest.param("windows-devel", None, True, id="windows-devel"),
+        pytest.param("system", None, False, id="system"),
+    ],
+)
+def test_rocm_device_lib_path(
+    monkeypatch, tmp_path: Path, layout, hip_device_lib_path, passes_device_lib_path
+):
     spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")
     setup_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(setup_module)
 
-    monkeypatch.setenv("FORCE_CUDA", "0")
-    monkeypatch.delenv("HIP_DEVICE_LIB_PATH", raising=False)
+    for name in _ROCM_LAYOUTS[layout]:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).touch()
+    if hip_device_lib_path is None:
+        monkeypatch.delenv("HIP_DEVICE_LIB_PATH", raising=False)
+    else:
+        monkeypatch.setenv("HIP_DEVICE_LIB_PATH", hip_device_lib_path)
+    monkeypatch.setenv("DEBUG", "0")
     monkeypatch.setattr(setup_module.torch.version, "hip", "7.2")
-    monkeypatch.setattr(setup_module.torch.version, "cuda", None)
-    rocm_home = _make_rocm_home(tmp_path, "rocm-no-device-libs")
-    monkeypatch.setattr(setup_module, "ROCM_HOME", rocm_home)
+    monkeypatch.setattr(setup_module, "ROCM_HOME", str(tmp_path))
+    monkeypatch.setattr(setup_module, "_should_build_cuda", lambda: True)
+    monkeypatch.setattr(
+        setup_module, "CUDAExtension", lambda name, sources, **kwargs: kwargs
+    )
 
-    with caplog.at_level("WARNING"):
-        assert setup_module._should_build_cuda() is False
-    assert "Set FORCE_CUDA=1" in caplog.text
-    assert rocm_home in caplog.text
+    (extension,) = setup_module.get_extensions()
+    bitcode = tmp_path / "lib" / "llvm" / "amdgcn" / "bitcode"
+    flag = f"--rocm-device-lib-path={bitcode}"
+    assert (flag in extension["extra_compile_args"]["nvcc"]) is passes_device_lib_path
 
-    # An explicit device library path is what clang uses instead.
-    monkeypatch.setenv("HIP_DEVICE_LIB_PATH", str(tmp_path / "lib/llvm/amdgcn/bitcode"))
-    assert setup_module._should_build_cuda() is True
+
+@pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm PyTorch")
+def test_hipcc_probe_agrees_with_gpu_build():
+    spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")
+    setup_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(setup_module)
+    torchrl_ext = pytest.importorskip("torchrl._torchrl")
+    if not hasattr(torchrl_ext, "CudaSumSegmentTreeFp32"):
+        pytest.skip("TorchRL was built without the GPU extension")
+
+    # hipcc built the GPU extension here, so the probe must accept it.
+    assert setup_module._hipcc_error() is None
 
 
 @pytest.mark.skipif(_IS_WINDOWS, reason="checks the Unix compiler flags")
@@ -286,6 +311,7 @@ def test_debug_build_device_debug_flag(monkeypatch, hip_version, debug_flag):
 
     monkeypatch.setenv("DEBUG", "1")
     monkeypatch.setattr(setup_module.torch.version, "hip", hip_version)
+    monkeypatch.setattr(setup_module, "ROCM_HOME", None)
     monkeypatch.setattr(setup_module, "_should_build_cuda", lambda: True)
     monkeypatch.setattr(
         setup_module, "CUDAExtension", lambda name, sources, **kwargs: kwargs
@@ -303,9 +329,8 @@ def test_hip_version_change_cleans_stale_extension(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("FORCE_CUDA", "0")
     monkeypatch.setattr(setup_module.torch.version, "hip", "7.2")
     monkeypatch.setattr(setup_module.torch.version, "cuda", None)
-    monkeypatch.setattr(
-        setup_module, "ROCM_HOME", _make_rocm_home(tmp_path / "rocm", "rocm")
-    )
+    monkeypatch.setattr(setup_module, "ROCM_HOME", "/rocm")
+    monkeypatch.setattr(setup_module, "_hipcc_error", lambda: None)
     monkeypatch.setattr(setup_module, "ROOT_DIR", tmp_path)
     build_info_file = tmp_path / "build" / ".torchrl_build_info.json"
     monkeypatch.setattr(setup_module, "_BUILD_INFO_FILE", build_info_file)

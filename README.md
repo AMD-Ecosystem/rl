@@ -468,8 +468,8 @@ torchrl`.
 
 On AMD GPUs, install TorchRL from source (see local development below) against
 a ROCm build of PyTorch: the GPU prioritized replay-buffer kernels are compiled
-whenever ROCm with `hipcc` is found. With the ROCm SDK Python packages, install
-`rocm[devel]` and run `rocm-sdk init` first.
+whenever a full ROCm installation with `hipcc` is found. With the ROCm SDK
+Python packages, install `rocm[devel]` and run `rocm-sdk init` first.
 
 Install common optional dependencies:
 
