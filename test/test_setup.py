@@ -287,6 +287,42 @@ def test_rocm_device_lib_path(
     assert (flag in extension["extra_compile_args"]["nvcc"]) is passes_device_lib_path
 
 
+@pytest.mark.parametrize(
+    "requires_cxx20,standard", [(True, "-std=c++20"), (False, "-std=c++17")]
+)
+def test_hipcc_probe_uses_build_cxx_standard(
+    monkeypatch, tmp_path: Path, requires_cxx20, standard
+):
+    spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")
+    setup_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(setup_module)
+
+    (tmp_path / "bin").mkdir()
+    for name in ("hipcc", "hipcc.exe"):
+        (tmp_path / "bin" / name).touch()
+    monkeypatch.setattr(setup_module, "ROCM_HOME", str(tmp_path))
+    monkeypatch.setattr(setup_module, "include_paths", lambda device_type: [])
+    monkeypatch.setattr(setup_module, "_hip_device_lib_args", lambda: [])
+    monkeypatch.setattr(
+        setup_module, "_torch_extension_requires_cxx20", lambda: requires_cxx20
+    )
+    standards = []
+
+    def hipcc(command, **kwargs):
+        # A compiler whose default standard is older than C++17, as on Windows:
+        # rocPRIM, included by PyTorch's HIP headers, stops the preprocessor.
+        standards.append([flag for flag in command if flag.startswith("-std=")])
+        if standards[-1]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+        error = 'rocprim/config.hpp:69:6: error: "rocPRIM requires at least C++17"'
+        return subprocess.CompletedProcess(command, 1, "", error)
+
+    monkeypatch.setattr(setup_module.subprocess, "run", hipcc)
+
+    assert setup_module._hipcc_error() is None
+    assert standards == [[standard]]
+
+
 @pytest.mark.skipif(torch.version.hip is None, reason="needs ROCm PyTorch")
 def test_hipcc_probe_agrees_with_gpu_build():
     spec = importlib.util.spec_from_file_location("torchrl_setup", _ROOT / "setup.py")

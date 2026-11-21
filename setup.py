@@ -81,9 +81,9 @@ def _hipcc_error() -> str | None:
     """Return why hipcc cannot compile the GPU extension, or None if it can.
 
     Preprocesses the ROCm headers the hipified kernel includes, with the flags the
-    build passes to hipcc. This fails when the ROCm device libraries or the math
-    library headers that PyTorch's HIP headers include (hipBLAS, hipSPARSE, ...)
-    are missing.
+    build passes to hipcc, including BuildExtension's C++ standard. This fails
+    when the ROCm device libraries or the math library headers that PyTorch's HIP
+    headers include (hipBLAS, hipSPARSE, ...) are missing.
     """
     rocm_bin = Path(ROCM_HOME) / "bin"
     hipcc_names = ("hipcc.exe", "hipcc.bat") if sys.platform == "win32" else ("hipcc",)
@@ -102,6 +102,9 @@ def _hipcc_error() -> str | None:
             str(source),
             "-o",
             str(Path(tmp) / "probe.i"),
+            # The compiler's default standard differs by platform (on Windows it
+            # is older than the C++17 rocPRIM requires), so pass the build's.
+            "-std=c++20" if _torch_extension_requires_cxx20() else "-std=c++17",
             *COMMON_HIP_FLAGS,
             *COMMON_HIPCC_FLAGS,
             *(f"--offload-arch={arch}" for arch in archs if arch),
